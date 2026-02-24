@@ -1,0 +1,23 @@
+# Environment — NEVER commit real credentials
+.env
+
+# Runtime state
+trading_state.json
+trading_state_backup_*.json
+
+# Logs
+*.log
+nohup.out
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
