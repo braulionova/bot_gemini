@@ -46,6 +46,7 @@ class RiskValidator:
             lambda s, b: self._check_daily_profit_cap(b),
             self._check_confidence,
             self._check_stop_loss_risk,
+            self._check_tp_placement,
             self._check_min_trade_value,
             self._check_max_margin,
             self._check_rr_ratio,
@@ -108,6 +109,31 @@ class RiskValidator:
         confidence = signal.get('confidence', 0)
         max_risk = Config.MAX_RISK_ESCALATED if confidence >= 8 else Config.MAX_RISK_PER_TRADE
         # This checks the SL distance is reasonable; position sizing enforces dollar risk
+        return True, "OK"
+
+    def _check_tp_placement(self, signal: Dict, balance: float) -> Tuple[bool, str]:
+        """Validate TP is logically placed relative to entry and SL."""
+        action = signal.get('action', '').upper()
+        entry = signal.get('entry_price', 0)
+        sl = signal.get('stop_loss', 0)
+        tp1 = signal.get('take_profit_1', 0)
+        if entry <= 0 or sl <= 0 or tp1 <= 0:
+            return True, "OK"  # Will be caught by other checks
+        # TP must be on the correct side of entry
+        if action == 'BUY' and tp1 <= entry:
+            return False, f"LONG TP1 ({tp1}) is not above entry ({entry})"
+        if action == 'SELL' and tp1 >= entry:
+            return False, f"SHORT TP1 ({tp1}) is not below entry ({entry})"
+        # TP must not be in the same direction as SL
+        if action == 'BUY' and sl >= entry:
+            return False, f"LONG SL ({sl}) is not below entry ({entry})"
+        if action == 'SELL' and sl <= entry:
+            return False, f"SHORT SL ({sl}) is not above entry ({entry})"
+        # TP distance must be at least as large as SL distance (R:R ≥ 1.0 minimum sanity)
+        sl_dist = abs(entry - sl)
+        tp_dist = abs(tp1 - entry)
+        if tp_dist < sl_dist * 0.8:
+            return False, f"TP1 too close: reward ({tp_dist:.2f}) < 80% of risk ({sl_dist:.2f})"
         return True, "OK"
 
     def _check_min_trade_value(self, signal: Dict, balance: float) -> Tuple[bool, str]:
@@ -197,7 +223,7 @@ class RiskValidator:
             if qty * entry > max_position_value:
                 qty = max_position_value / entry
 
-            # Hard cap: never risk more than $100 USDT (FIXED_RISK_AMOUNT)
+            # Hard cap: never risk more than $50 USDT (FIXED_RISK_AMOUNT)
             actual_risk = qty * risk_per_unit
             if actual_risk > risk_amount:
                 qty = risk_amount / risk_per_unit

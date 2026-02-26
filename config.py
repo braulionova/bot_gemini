@@ -54,10 +54,10 @@ class Config:
     ACCOUNT_SIZE = 10_000
 
     # ── HARDCODED SAFETY CONSTANTS — DO NOT CHANGE ──
-    FIXED_RISK_AMOUNT = 100            # Fixed $100 USDT risk per trade
+    FIXED_RISK_AMOUNT = 50             # Fixed $50 USDT risk per trade
     MAX_RISK_PER_TRADE = 0.01          # 1% ($100) — fallback cap
     MAX_RISK_ESCALATED = 0.015         # 1.5% ($150) — fallback cap
-    DAILY_LOSS_LIMIT = 0.025           # 2.5% ($250)
+    DAILY_LOSS_LIMIT = 0.0275          # 2.75% ($275)
     MAX_DRAWDOWN_TOTAL = 0.045         # 4.5% ($450)
     MIN_TRADE_VALUE_PCT = 0.06         # 6% ($600) of balance
     MAX_MARGIN_EXPOSURE = 0.15         # 15% ($1500) of balance

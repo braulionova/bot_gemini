@@ -90,7 +90,51 @@ class IndicatorEngine:
         df['volume_sma'] = df['volume'].rolling(window=20).mean()
         df['volume_ratio'] = df['volume'] / df['volume_sma']
 
+        # ── VWAP (anchored to daily sessions) ──
+        df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
+        df['tp_vol'] = df['typical_price'] * df['volume']
+        if 'timestamp' in df.columns:
+            df['_date'] = df['timestamp'].dt.date
+            df['cum_tp_vol'] = df.groupby('_date')['tp_vol'].cumsum()
+            df['cum_vol_grp'] = df.groupby('_date')['volume'].cumsum()
+            df['vwap'] = df['cum_tp_vol'] / df['cum_vol_grp']
+            df.drop(columns=['_date', 'cum_tp_vol', 'cum_vol_grp'], inplace=True)
+        else:
+            rolling_tp_vol = df['tp_vol'].rolling(window=24).sum()
+            rolling_vol = df['volume'].rolling(window=24).sum()
+            df['vwap'] = rolling_tp_vol / rolling_vol
+        df.drop(columns=['tp_vol'], inplace=True)
+
+        # ── CVD (Cumulative Volume Delta) ──
+        candle_delta = df.apply(
+            lambda r: r['volume'] if r['close'] >= r['open'] else -r['volume'], axis=1
+        )
+        df['cvd'] = candle_delta.cumsum()
+        df['cvd_sma'] = df['cvd'].rolling(window=20).mean()
+
         return df
+
+    @staticmethod
+    def calculate_pivot_points(daily_df: pd.DataFrame) -> Dict:
+        """Calculate Classic Pivot Points from the previous daily candle."""
+        if daily_df.empty or len(daily_df) < 2:
+            return {}
+        prev = daily_df.iloc[-2]  # Previous completed day
+        h = float(prev['high'])
+        l = float(prev['low'])
+        c = float(prev['close'])
+        pp = (h + l + c) / 3
+        r1 = 2 * pp - l
+        s1 = 2 * pp - h
+        r2 = pp + (h - l)
+        s2 = pp - (h - l)
+        r3 = h + 2 * (pp - l)
+        s3 = l - 2 * (h - pp)
+        return {
+            'pp': round(pp, 4),
+            'r1': round(r1, 4), 'r2': round(r2, 4), 'r3': round(r3, 4),
+            's1': round(s1, 4), 's2': round(s2, 4), 's3': round(s3, 4),
+        }
 
     @staticmethod
     def detect_order_blocks(df: pd.DataFrame) -> List[Dict]:
@@ -149,6 +193,93 @@ class IndicatorEngine:
         return order_blocks[:5]
 
     @staticmethod
+    def calculate_tp_levels(df: pd.DataFrame, pivot_points: Dict, atr: float) -> Dict:
+        """
+        Calculate professional TP target levels anchored to real technical structure.
+        Returns ordered TP candidates for LONG and SHORT setups.
+        """
+        if df.empty or atr <= 0:
+            return {}
+
+        current_price = float(df['close'].iloc[-1])
+
+        # Collect key structural levels
+        resistances = []  # levels above price (for LONG TPs)
+        supports = []     # levels below price (for SHORT TPs)
+
+        # 1. Pivot Points
+        for key, val in pivot_points.items():
+            if val and val != current_price:
+                if val > current_price:
+                    resistances.append({'level': val, 'source': f'Pivot {key.upper()}'})
+                else:
+                    supports.append({'level': val, 'source': f'Pivot {key.upper()}'})
+
+        # 2. Recent swing highs (last 50 candles, 4H-level structure)
+        recent = df.tail(50)
+        for i in range(2, len(recent) - 2):
+            h = float(recent['high'].iloc[i])
+            if h > float(recent['high'].iloc[i-1]) and h > float(recent['high'].iloc[i+1]):
+                if h > current_price * 1.003:  # min 0.3% away
+                    resistances.append({'level': round(h, 2), 'source': 'Swing High'})
+
+        # 3. Recent swing lows
+        for i in range(2, len(recent) - 2):
+            l = float(recent['low'].iloc[i])
+            if l < float(recent['low'].iloc[i-1]) and l < float(recent['low'].iloc[i+1]):
+                if l < current_price * 0.997:  # min 0.3% away
+                    supports.append({'level': round(l, 2), 'source': 'Swing Low'})
+
+        # 4. Bollinger Band levels
+        if 'bb_upper' in df.columns and 'bb_lower' in df.columns:
+            bb_upper = float(df['bb_upper'].iloc[-1])
+            bb_lower = float(df['bb_lower'].iloc[-1])
+            if not pd.isna(bb_upper) and bb_upper > current_price:
+                resistances.append({'level': round(bb_upper, 2), 'source': 'BB Upper'})
+            if not pd.isna(bb_lower) and bb_lower < current_price:
+                supports.append({'level': round(bb_lower, 2), 'source': 'BB Lower'})
+
+        # 5. ATR-based minimum targets (1.5x, 2.5x, 4x ATR from price)
+        for mult, label in [(1.5, '1.5xATR'), (2.5, '2.5xATR'), (4.0, '4xATR')]:
+            resistances.append({'level': round(current_price + mult * atr, 2), 'source': label})
+            supports.append({'level': round(current_price - mult * atr, 2), 'source': label})
+
+        # 6. VWAP
+        if 'vwap' in df.columns:
+            vwap_val = float(df['vwap'].iloc[-1])
+            if not pd.isna(vwap_val) and vwap_val > 0:
+                if vwap_val > current_price * 1.003:
+                    resistances.append({'level': round(vwap_val, 2), 'source': 'VWAP'})
+                elif vwap_val < current_price * 0.997:
+                    supports.append({'level': round(vwap_val, 2), 'source': 'VWAP'})
+
+        # Sort: resistances ascending (nearest first), supports descending (nearest first)
+        resistances = sorted(resistances, key=lambda x: x['level'])
+        supports = sorted(supports, key=lambda x: x['level'], reverse=True)
+
+        # Deduplicate levels within 0.5% of each other (keep first/nearest)
+        def dedup(levels: list, tol_pct: float = 0.005) -> list:
+            out = []
+            for lv in levels:
+                if not out or abs(lv['level'] - out[-1]['level']) / out[-1]['level'] > tol_pct:
+                    out.append(lv)
+            return out
+
+        resistances = dedup(resistances)
+        supports = dedup(supports)
+
+        # Build structured output: pick the best 3 TPs for each direction
+        long_tps = [{'tp': r['level'], 'source': r['source'], 'rr': round((r['level'] - current_price) / (atr * 0.8), 2)} for r in resistances[:5]]
+        short_tps = [{'tp': s['level'], 'source': s['source'], 'rr': round((current_price - s['level']) / (atr * 0.8), 2)} for s in supports[:5]]
+
+        return {
+            'current_price': round(current_price, 2),
+            'atr': round(atr, 2),
+            'long_tp_candidates': long_tps,    # for BUY setups
+            'short_tp_candidates': short_tps,  # for SELL setups
+        }
+
+    @staticmethod
     def get_indicator_summary(df: pd.DataFrame) -> Dict:
         """Extract latest indicator values as a dict for Gemini prompt."""
         if df.empty:
@@ -188,7 +319,22 @@ class IndicatorEngine:
             'obv': safe(c.get('obv')),
             'obv_sma': safe(c.get('obv_sma')),
             'volume_ratio': safe(c.get('volume_ratio')),
+            'vwap': safe(c.get('vwap')),
+            'cvd': safe(c.get('cvd')),
+            'cvd_sma': safe(c.get('cvd_sma')),
         }
+        # VWAP bias: above = bullish, below = bearish
+        vwap = c.get('vwap')
+        price = c.get('close')
+        if vwap and price and not pd.isna(vwap) and not pd.isna(price) and float(vwap) > 0:
+            vwap_pct = ((float(price) - float(vwap)) / float(vwap)) * 100
+            summary['vwap_bias_pct'] = round(vwap_pct, 3)
+        # CVD trend: rising = buying pressure, falling = selling
+        if len(df) >= 5:
+            cvd_now = c.get('cvd')
+            cvd_5ago = df.iloc[-5].get('cvd') if 'cvd' in df.columns else None
+            if cvd_now is not None and cvd_5ago is not None and not pd.isna(cvd_now) and not pd.isna(cvd_5ago):
+                summary['cvd_trend'] = 'rising' if float(cvd_now) > float(cvd_5ago) else 'falling'
 
         # Price action context (last 5 candles)
         recent = []
